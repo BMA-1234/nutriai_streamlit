@@ -1,5 +1,5 @@
 """
-NutriAI — AI nutrition coach
+WellPlate — AI nutrition coach
 Runs in LOCAL MODE (SQLite, no login required) when Supabase is not configured.
 Runs in CLOUD MODE (Supabase auth + cloud DB + Stripe) when credentials are set.
 
@@ -11,7 +11,8 @@ CREATE TABLE profiles (
   calorie_goal INTEGER DEFAULT 2000, protein_goal_g INTEGER DEFAULT 120,
   carbs_goal_g INTEGER DEFAULT 250, fat_goal_g INTEGER DEFAULT 65,
   water_goal_ml INTEGER DEFAULT 2500, activity_level TEXT DEFAULT 'moderate',
-  dietary_pref TEXT DEFAULT 'none', subscription TEXT DEFAULT 'free',
+  dietary_pref TEXT DEFAULT 'none', blood_group TEXT DEFAULT 'unknown',
+  subscription TEXT DEFAULT 'free',
   stripe_customer_id TEXT, ai_calls_this_month INTEGER DEFAULT 0,
   ai_calls_reset_date TEXT DEFAULT to_char(CURRENT_DATE,'YYYY-MM-DD')
 );
@@ -44,14 +45,14 @@ CREATE POLICY "own weight"  ON weight_log FOR ALL USING (auth.uid() = user_id);
 """
 
 import streamlit as st
-import sqlite3, json, uuid, requests
+import sqlite3, json, uuid, requests, hashlib, os
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
 # ── Page config ────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="NutriAI", page_icon="🥗",
+st.set_page_config(page_title="WellPlate", page_icon="🥗",
                    layout="wide", initial_sidebar_state="expanded")
 
 # ── CSS ────────────────────────────────────────────────────────────────────────
@@ -119,7 +120,7 @@ USE_SUPABASE = bool(_secrets.get("SUPABASE_URL","") and _secrets.get("SUPABASE_A
 # ══════════════════════════════════════════════════════════════════════════════
 # LOCAL MODE — SQLite backend
 # ══════════════════════════════════════════════════════════════════════════════
-DB_PATH = Path(__file__).parent / "nutriai.db"
+DB_PATH = Path(__file__).parent / "wellplate.db"
 
 def _conn():
     c = sqlite3.connect(DB_PATH); c.row_factory = sqlite3.Row; return c
@@ -134,7 +135,8 @@ def _init_db():
           calorie_goal INTEGER DEFAULT 2000, protein_goal_g INTEGER DEFAULT 120,
           carbs_goal_g INTEGER DEFAULT 250, fat_goal_g INTEGER DEFAULT 65,
           water_goal_ml INTEGER DEFAULT 2500, activity_level TEXT DEFAULT 'moderate',
-          dietary_pref TEXT DEFAULT 'none', subscription TEXT DEFAULT 'free',
+          dietary_pref TEXT DEFAULT 'none', blood_group TEXT DEFAULT 'unknown',
+          subscription TEXT DEFAULT 'free',
           ai_calls_this_month INTEGER DEFAULT 0,
           ai_calls_reset_date TEXT DEFAULT ''
         );
@@ -155,6 +157,11 @@ def _init_db():
           weight_kg REAL NOT NULL, notes TEXT DEFAULT '', created_at TEXT NOT NULL
         );
         """)
+    try:  # migration: add blood_group to existing DBs
+        with _conn() as c:
+            c.execute("ALTER TABLE profile ADD COLUMN blood_group TEXT DEFAULT 'unknown'")
+    except Exception:
+        pass
 
 if not USE_SUPABASE:
     _init_db()
@@ -169,12 +176,13 @@ def _local_save_profile(data):
     with _conn() as c:
         c.execute("""UPDATE profile SET name=?,age=?,height_cm=?,weight_kg=?,
           calorie_goal=?,protein_goal_g=?,carbs_goal_g=?,fat_goal_g=?,
-          water_goal_ml=?,activity_level=?,dietary_pref=?,subscription=?,
-          ai_calls_this_month=?,ai_calls_reset_date=? WHERE id=1""",
+          water_goal_ml=?,activity_level=?,dietary_pref=?,blood_group=?,
+          subscription=?,ai_calls_this_month=?,ai_calls_reset_date=? WHERE id=1""",
           (p.get("name","User"),p.get("age",30),p.get("height_cm",170),p.get("weight_kg",70),
            p.get("calorie_goal",2000),p.get("protein_goal_g",120),p.get("carbs_goal_g",250),
            p.get("fat_goal_g",65),p.get("water_goal_ml",2500),p.get("activity_level","moderate"),
-           p.get("dietary_pref","none"),p.get("subscription","free"),
+           p.get("dietary_pref","none"),p.get("blood_group","unknown"),
+           p.get("subscription","free"),
            p.get("ai_calls_this_month",0),p.get("ai_calls_reset_date","")))
 
 def _local_get_meals(day):
@@ -227,48 +235,53 @@ def get_sb():
     if not USE_SUPABASE: return None
     try:
         from supabase import create_client
-        client = create_client(_secrets.get("SUPABASE_URL",""), _secrets.get("SUPABASE_ANON_KEY",""))
-        if st.session_state.get("access_token"):
-            client.auth.set_session(st.session_state.access_token, st.session_state.get("refresh_token",""))
-        return client
+        return create_client(_secrets.get("SUPABASE_URL",""), _secrets.get("SUPABASE_ANON_KEY",""))
     except: return None
+
+def _hash_pw(password, salt=None):
+    if salt is None: salt = os.urandom(16).hex()
+    h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000)
+    return f"{salt}${h.hex()}"
+
+def _verify_pw(password, stored):
+    try:
+        salt, _ = stored.split("$", 1)
+        return _hash_pw(password, salt) == stored
+    except: return False
 
 def sign_up(email, password, name):
     sb = get_sb()
     if not sb: return False, "Supabase not configured."
     try:
-        res = sb.auth.sign_up({"email":email,"password":password})
-        if res.user:
-            if res.session:
-                st.session_state.access_token = res.session.access_token
-                st.session_state.refresh_token = res.session.refresh_token
-                st.session_state.user_id = res.user.id
-                st.session_state.user_email = email
-                sb.table("profiles").upsert({"id":res.user.id,"name":name or "User"}).execute()
-                return True, ""
-            return True, "Check your email to confirm, then sign in."
-        return False, "Sign up failed."
+        existing = sb.table("profiles").select("id").eq("email", email).execute()
+        if existing.data: return False, "Email already registered. Please sign in."
+        user_id = str(uuid.uuid4())
+        sb.table("profiles").insert({
+            "id": user_id, "email": email,
+            "password_hash": _hash_pw(password), "name": name or "User"
+        }).execute()
+        st.session_state.access_token = user_id
+        st.session_state.user_id = user_id
+        st.session_state.user_email = email
+        return True, ""
     except Exception as e: return False, str(e)
 
 def sign_in(email, password):
     sb = get_sb()
     if not sb: return False, "Supabase not configured."
     try:
-        res = sb.auth.sign_in_with_password({"email":email,"password":password})
-        if res.user and res.session:
-            st.session_state.access_token = res.session.access_token
-            st.session_state.refresh_token = res.session.refresh_token
-            st.session_state.user_id = res.user.id
-            st.session_state.user_email = email
-            return True, ""
-        return False, "Invalid email or password."
+        res = sb.table("profiles").select("id,password_hash").eq("email", email).execute()
+        if not res.data: return False, "Email not found. Please create an account."
+        user = res.data[0]
+        if not _verify_pw(password, user["password_hash"]):
+            return False, "Wrong password."
+        st.session_state.access_token = user["id"]
+        st.session_state.user_id = user["id"]
+        st.session_state.user_email = email
+        return True, ""
     except Exception as e: return False, str(e)
 
 def sign_out():
-    sb = get_sb()
-    if sb:
-        try: sb.auth.sign_out()
-        except: pass
     st.session_state.update({"access_token":None,"refresh_token":None,
         "user_id":None,"user_email":None,"chat_history":[],"onboarded":False})
     st.session_state.page = "auth" if USE_SUPABASE else "dashboard"
@@ -278,12 +291,17 @@ def _uid(): return st.session_state.get("user_id","")
 def _dp():
     return {"name":"User","age":30,"height_cm":170,"weight_kg":70,"calorie_goal":2000,
             "protein_goal_g":120,"carbs_goal_g":250,"fat_goal_g":65,"water_goal_ml":2500,
-            "activity_level":"moderate","dietary_pref":"none","subscription":"free",
-            "ai_calls_this_month":0,"ai_calls_reset_date":date.today().isoformat()}
+            "activity_level":"moderate","dietary_pref":"none","blood_group":"unknown",
+            "subscription":"free","ai_calls_this_month":0,
+            "ai_calls_reset_date":date.today().isoformat()}
 
 # ── Unified DB interface ───────────────────────────────────────────────────────
+def _use_local():
+    uid = _uid()
+    return not USE_SUPABASE or uid == "local" or not uid
+
 def get_profile():
-    if not USE_SUPABASE: return _local_get_profile() or _dp()
+    if _use_local(): return _local_get_profile() or _dp()
     sb = get_sb()
     if not sb or not _uid(): return _dp()
     try:
@@ -292,14 +310,15 @@ def get_profile():
     except: return _dp()
 
 def save_profile(data):
-    if not USE_SUPABASE: _local_save_profile(data); return
+    if _use_local(): _local_save_profile(data); return
     sb = get_sb()
     if sb and _uid():
-        try: sb.table("profiles").upsert({"id":_uid(),**data}).execute()
+        safe = {k:v for k,v in data.items() if k not in ("id","email","password_hash")}
+        try: sb.table("profiles").update(safe).eq("id", _uid()).execute()
         except: pass
 
 def get_meals(day):
-    if not USE_SUPABASE: return _local_get_meals(day)
+    if _use_local(): return _local_get_meals(day)
     sb = get_sb()
     if not sb or not _uid(): return []
     try:
@@ -308,21 +327,21 @@ def get_meals(day):
     except: return []
 
 def log_meal(meal):
-    if not USE_SUPABASE: _local_log_meal(meal); return
+    if _use_local(): _local_log_meal(meal); return
     sb = get_sb()
     if sb and _uid():
         try: sb.table("meals").insert({**meal,"user_id":_uid()}).execute()
         except: pass
 
 def delete_meal(mid):
-    if not USE_SUPABASE: _local_delete_meal(mid); return
+    if _use_local(): _local_delete_meal(mid); return
     sb = get_sb()
     if sb and _uid():
         try: sb.table("meals").delete().eq("id",mid).eq("user_id",_uid()).execute()
         except: pass
 
 def get_water_today(day):
-    if not USE_SUPABASE: return _local_get_water(day)
+    if _use_local(): return _local_get_water(day)
     sb = get_sb()
     if not sb or not _uid(): return 0
     try:
@@ -331,7 +350,7 @@ def get_water_today(day):
     except: return 0
 
 def add_water(day, ml):
-    if not USE_SUPABASE: _local_add_water(day, ml); return
+    if _use_local(): _local_add_water(day, ml); return
     sb = get_sb()
     if sb and _uid():
         try:
@@ -340,7 +359,7 @@ def add_water(day, ml):
         except: pass
 
 def get_meals_range(days):
-    if not USE_SUPABASE: return _local_meals_range(days)
+    if _use_local(): return _local_meals_range(days)
     sb = get_sb()
     if not sb or not _uid(): return []
     start = (date.today()-timedelta(days=days)).isoformat()
@@ -350,7 +369,7 @@ def get_meals_range(days):
     except: return []
 
 def get_weight_range(days):
-    if not USE_SUPABASE: return _local_weight_range(days)
+    if _use_local(): return _local_weight_range(days)
     sb = get_sb()
     if not sb or not _uid(): return []
     start = (date.today()-timedelta(days=days)).isoformat()
@@ -404,7 +423,7 @@ def create_checkout_url(email):
         import stripe
         stripe.api_key = _secrets.get("STRIPE_SECRET_KEY","")
         if not stripe.api_key: return None
-        app_url = _secrets.get("APP_URL","https://nutriai.streamlit.app")
+        app_url = _secrets.get("APP_URL","https://wellplate.streamlit.app")
         s = stripe.checkout.Session.create(
             customer_email=email, payment_method_types=["card"],
             line_items=[{"price":_secrets.get("STRIPE_PRICE_ID",""),"quantity":1}],
@@ -435,7 +454,7 @@ def call_ai(messages, max_tokens=800):
     if not key: raise ValueError("No API key — go to ⚙️ Settings.")
     resp = requests.post(OPENROUTER_URL, timeout=60, headers={
         "Authorization":f"Bearer {key}","Content-Type":"application/json",
-        "HTTP-Referer":"https://nutriai.app"},
+        "HTTP-Referer":"https://wellplate.app"},
         json={"model":OPENROUTER_MODEL,"max_tokens":max_tokens,"messages":messages})
     if resp.status_code != 200:
         try: msg = resp.json().get("error",{}).get("message",resp.text)
@@ -457,7 +476,7 @@ def ai_chat(user_msg, history, p, today_meals):
     meals_txt = "\n".join(f"  - {m['meal_type'].title()}: {m['food_name']} ({int(m['calories'])} kcal)"
                           for m in today_meals) or "  No meals logged yet."
     total_cal = sum(m["calories"] for m in today_meals)
-    system = f"""You are NutriAI, a friendly expert nutrition coach.
+    system = f"""You are WellPlate, a friendly expert nutrition coach.
 Today: {date.today().strftime('%A, %B %d %Y')}
 User: {p.get('name','User')}, goal {p.get('calorie_goal',2000)} kcal/day
 Consumed: {int(total_cal)} kcal ({int(p.get('calorie_goal',2000)-total_cal)} remaining)
@@ -491,6 +510,41 @@ def search_food(query):
 
 # ── UI helpers ─────────────────────────────────────────────────────────────────
 MEAL_ICONS = {"breakfast":"🌅","lunch":"☀️","dinner":"🌙","snack":"🍎"}
+
+BLOOD_TYPE_DIET = {
+    "A": {
+        "label": "Type A — The Agrarian", "emoji": "🌿",
+        "desc": "Thrives on a plant-rich diet. Sensitive digestive system, benefits from organic, fresh foods.",
+        "beneficial": ["Tofu","Tempeh","Seafood","Sardines","Salmon","Legumes","Lentils","Beans",
+                       "Grains (oats, rye)","Vegetables","Garlic","Ginger","Green tea","Berries","Plums"],
+        "avoid": ["Red meat","Pork","Dairy (milk, ice cream)","Kidney beans","Lima beans",
+                  "Wheat (excess)","Corn","Potatoes","Peppers","Vinegar"],
+    },
+    "B": {
+        "label": "Type B — The Nomad", "emoji": "🥛",
+        "desc": "Balanced omnivore. Tolerates dairy well and benefits from a varied diet.",
+        "beneficial": ["Lamb","Mutton","Venison","Rabbit","Dairy (yogurt, cheese)","Eggs",
+                       "Oats","Millet","Rice","Green vegetables","Pineapple","Ginger"],
+        "avoid": ["Chicken","Pork","Corn","Lentils","Peanuts","Sesame seeds",
+                  "Wheat","Buckwheat","Tomatoes","Coconut"],
+    },
+    "AB": {
+        "label": "Type AB — The Enigma", "emoji": "⚗️",
+        "desc": "Combines A and B traits. Adapts to many foods but has a sensitive digestive system.",
+        "beneficial": ["Tofu","Tempeh","Seafood (tuna, salmon, sardines)","Dairy (yogurt, kefir)",
+                       "Green vegetables","Garlic","Ginger","Grapes","Cherries","Pineapple","Kelp"],
+        "avoid": ["Red meat","Chicken","Corn","Kidney beans","Buckwheat",
+                  "Peppers","Bananas","Mushrooms","Vinegar","Alcohol"],
+    },
+    "O": {
+        "label": "Type O — The Hunter", "emoji": "🥩",
+        "desc": "High-protein diet. Benefits from lean meats, fish, and vegetables.",
+        "beneficial": ["Lean beef","Lamb","Fish","Cod","Herring","Mackerel","Kelp","Broccoli",
+                       "Spinach","Sweet potatoes","Plums","Figs","Walnuts","Olive oil"],
+        "avoid": ["Wheat","Corn","Oats","Dairy (milk, cheese)","Lentils","Kidney beans",
+                  "Peanuts","Cabbage","Cauliflower","Avocado (excess)","Coffee"],
+    },
+}
 TODAY = date.today().isoformat()
 
 def totals(meals):
@@ -556,7 +610,7 @@ if st.session_state.page == "auth":
     with col:
         st.markdown("""<div style='text-align:center;padding:40px 0 24px'>
           <div style='font-size:52px'>🥗</div>
-          <div style='font-size:28px;font-weight:800;color:#1B5E20;margin-top:8px'>NutriAI</div>
+          <div style='font-size:28px;font-weight:800;color:#1B5E20;margin-top:8px'>WellPlate</div>
           <div style='font-size:14px;color:#78909C;margin-top:4px'>Your AI Nutrition Coach</div>
         </div>""", unsafe_allow_html=True)
         tab_in,tab_up = st.tabs(["Sign In","Create Account"])
@@ -586,7 +640,16 @@ if st.session_state.page == "auth":
                             if msg: st.info(msg)
                             else: st.session_state.page="onboarding"; st.rerun()
                         else: st.error(msg)
-        st.markdown("<div style='text-align:center;margin-top:20px;font-size:12px;color:#90A4AE'>"
+        st.divider()
+        st.markdown("<div style='text-align:center;font-size:13px;color:#78909C;margin-bottom:10px'>or</div>", unsafe_allow_html=True)
+        if st.button("💻 Continue as Guest (local mode)", use_container_width=True):
+            st.session_state.update({
+                "access_token": "local", "refresh_token": "local",
+                "user_id": "local", "user_email": "guest",
+            })
+            st.session_state.page = "dashboard"
+            st.rerun()
+        st.markdown("<div style='text-align:center;margin-top:16px;font-size:12px;color:#90A4AE'>"
                     "Free forever · AI-powered · No credit card required</div>", unsafe_allow_html=True)
     st.stop()
 
@@ -604,11 +667,18 @@ if not USE_SUPABASE:
 with st.sidebar:
     p_sub = profile.get("subscription","free")
     ai_used = profile.get("ai_calls_this_month",0)
-    st.markdown(f"""<div style='padding:14px 0 6px 0'>
-      <div style='font-size:22px;font-weight:800'>🥗 NutriAI</div>
-      {'<span class="premium-badge">⭐ Premium</span>' if p_sub=="premium" else ""}
+    st.markdown(f"""
+    <div style='padding:16px 0 4px 0;display:flex;align-items:center;gap:10px'>
+      <div style='background:rgba(255,255,255,0.15);border-radius:10px;padding:6px 8px;font-size:20px'>🥗</div>
+      <div>
+        <div style='font-size:20px;font-weight:800;letter-spacing:-0.3px'>WellPlate</div>
+        <div style='font-size:10px;opacity:.7;letter-spacing:1px;text-transform:uppercase'>AI Nutrition Coach</div>
+      </div>
+      {'<span class="premium-badge" style="margin-inline-start:auto">⭐ Premium</span>' if p_sub=="premium" else ""}
     </div>
-    <div style='padding:6px 0 10px 0;font-size:13px;opacity:.85'>👋 Hello, {profile.get('name','User')}!</div>
+    <div style='margin:10px 0 12px;padding:10px 12px;background:rgba(255,255,255,0.1);border-radius:10px;font-size:13px'>
+      Welcome back, <b>{profile.get('name','there')}</b> 👋
+    </div>
     <hr/>""", unsafe_allow_html=True)
     nav = st.radio("Nav",["🏠  Dashboard","🍽️  Log Meal","🤖  AI Chat",
         "📊  Progress","👤  Profile & Goals","⚙️  Settings"],label_visibility="collapsed")
@@ -639,7 +709,7 @@ if not st.session_state.onboarded and st.session_state.page not in ("auth","onbo
 if st.session_state.page == "onboarding":
     st.markdown("""<div style='text-align:center;padding:30px 0 10px'>
       <div style='font-size:56px'>🥗</div>
-      <div style='font-size:32px;font-weight:800;color:#1B5E20;margin-top:8px'>Welcome to NutriAI</div>
+      <div style='font-size:32px;font-weight:800;color:#1B5E20;margin-top:8px'>Welcome to WellPlate</div>
       <div style='font-size:16px;color:#555;margin-top:6px'>Set up your profile in 30 seconds.</div>
     </div>""", unsafe_allow_html=True)
     st.markdown("<br/>",unsafe_allow_html=True)
@@ -673,7 +743,7 @@ elif st.session_state.page == "dashboard":
 
     st.markdown(f"""<div class="app-header">
       <div class="app-logo">🥗</div>
-      <div><div style='font-size:22px;font-weight:800;color:#1B5E20'>NutriAI</div>
+      <div><div style='font-size:22px;font-weight:800;color:#1B5E20'>WellPlate</div>
         <div style='font-size:12px;color:#78909C'>{date.today().strftime('%A, %B %d %Y')}</div></div>
       <div style='margin-left:auto'><span class="streak">🔥 {streak} day streak</span></div>
     </div>""", unsafe_allow_html=True)
@@ -874,14 +944,14 @@ elif st.session_state.page == "chat":
     if not st.session_state.chat_history:
         st.markdown("""<div style='text-align:center;padding:40px 20px;color:#78909C'>
           <div style='font-size:42px'>🤖</div>
-          <div style='font-weight:600;margin-top:10px'>NutriAI is ready to help</div>
+          <div style='font-weight:600;margin-top:10px'>WellPlate is ready to help</div>
           <div style='font-size:13px;margin-top:4px'>Ask about nutrition, get meal ideas, or get a diet analysis</div>
         </div>""",unsafe_allow_html=True)
     else:
         for h in st.session_state.chat_history:
             st.markdown(f'<div class="chat-meta">You</div><div class="chat-user">{h["user"]}</div>',unsafe_allow_html=True)
-            st.markdown(f'<div class="chat-meta">🤖 NutriAI</div><div class="chat-ai">{h["ai"]}</div>',unsafe_allow_html=True)
-    user_input=st.chat_input("Ask NutriAI anything about your nutrition…")
+            st.markdown(f'<div class="chat-meta">🤖 WellPlate</div><div class="chat-ai">{h["ai"]}</div>',unsafe_allow_html=True)
+    user_input=st.chat_input("Ask WellPlate anything about your nutrition…")
     final_input=selected_prompt or user_input
     if final_input:
         if not st.session_state.api_key: st.error("No API key — go to ⚙️ Settings.")
@@ -991,7 +1061,7 @@ elif st.session_state.page == "progress":
 elif st.session_state.page == "profile":
     st.markdown("## 👤 Profile & Goals")
     p=profile
-    tab_personal,tab_goals,tab_diet=st.tabs(["👤 Personal","🎯 Daily Goals","🥦 Diet"])
+    tab_personal,tab_goals,tab_diet,tab_blood=st.tabs(["👤 Personal","🎯 Daily Goals","🥦 Diet","🩸 Blood Type"])
     with tab_personal:
         with st.form("profile_form"):
             c1,c2=st.columns(2)
@@ -1035,6 +1105,37 @@ elif st.session_state.page == "profile":
                     "gluten_free":"🌾 Gluten-free","halal":"☪️ Halal","kosher":"✡️ Kosher"}[x])
             if st.form_submit_button("💾 Save",type="primary"):
                 save_profile({"dietary_pref":pref}); st.success("Saved!")
+    with tab_blood:
+        BG_OPTIONS = ["unknown","A+","A-","B+","B-","AB+","AB-","O+","O-"]
+        current_bg = p.get("blood_group","unknown")
+        if current_bg not in BG_OPTIONS: current_bg = "unknown"
+        with st.form("blood_form"):
+            bg = st.selectbox("Blood Group",BG_OPTIONS,
+                index=BG_OPTIONS.index(current_bg),
+                format_func=lambda x: "❓ Unknown" if x=="unknown" else f"🩸 {x}")
+            if st.form_submit_button("💾 Save Blood Group",type="primary"):
+                save_profile({"blood_group":bg}); st.success("Saved!"); st.rerun()
+        # Derive base type (A/B/AB/O) ignoring Rh factor
+        base = None
+        for t in ["AB","A","B","O"]:
+            if current_bg.startswith(t):
+                base = t; break
+        if base and base in BLOOD_TYPE_DIET:
+            d = BLOOD_TYPE_DIET[base]
+            st.markdown(f"### {d['emoji']} {d['label']}")
+            st.info(d["desc"])
+            col_b, col_a = st.columns(2)
+            with col_b:
+                st.markdown("**✅ Beneficial foods**")
+                for food in d["beneficial"]:
+                    st.markdown(f"- {food}")
+            with col_a:
+                st.markdown("**❌ Foods to avoid**")
+                for food in d["avoid"]:
+                    st.markdown(f"- {food}")
+            st.caption("Based on the Blood Type Diet theory (D'Adamo). Consult a healthcare professional before making dietary changes.")
+        elif current_bg == "unknown":
+            st.info("Select your blood group above to see personalized food recommendations.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SETTINGS
@@ -1084,7 +1185,7 @@ elif st.session_state.page == "settings":
         all_meals=get_meals_range(365)
         mode_label = "☁️ Cloud (Supabase)" if USE_SUPABASE else "💻 Local (SQLite)"
         account = st.session_state.get('user_email','Local') if USE_SUPABASE else "Local Mode"
-        st.markdown(f"""| | |\n|---|---|\n| **App** | NutriAI |\n| **Mode** | {mode_label} |
+        st.markdown(f"""| | |\n|---|---|\n| **App** | WellPlate |\n| **Mode** | {mode_label} |
 | **Account** | {account} |\n| **Plan** | {'⭐ Premium' if p_sub=='premium' else 'Free'} |
 | **Meals logged** | {len(all_meals)} |""")
         st.divider()
@@ -1092,7 +1193,7 @@ elif st.session_state.page == "settings":
             import json as _json
             st.download_button("⬇️ Export meals as JSON",
                 data=_json.dumps(all_meals,indent=2),
-                file_name=f"nutriai_export_{date.today()}.json",mime="application/json")
+                file_name=f"wellplate_export_{date.today()}.json",mime="application/json")
         st.divider()
         st.markdown('<div style="color:#EF5350;font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase">Danger Zone</div>',unsafe_allow_html=True)
         if st.button("🗑️ Delete ALL my data",type="secondary"):
@@ -1108,3 +1209,4 @@ elif st.session_state.page == "settings":
                 with _conn() as c:
                     c.execute("DELETE FROM meals"); c.execute("DELETE FROM water_log")
                 st.success("All data cleared."); st.rerun()
+
