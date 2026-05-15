@@ -418,15 +418,19 @@ def check_ai_usage():
     save_profile({"ai_calls_this_month": calls+1})
     return True, ""
 
+def _get_secret(key, default=""):
+    try: return st.secrets.get(key, default)
+    except: return default
+
 def create_checkout_url(email):
     try:
         import stripe
-        stripe.api_key = _secrets.get("STRIPE_SECRET_KEY","")
+        stripe.api_key = _get_secret("STRIPE_SECRET_KEY")
         if not stripe.api_key: return None
-        app_url = _secrets.get("APP_URL","https://wellplate.streamlit.app")
+        app_url = _get_secret("APP_URL","https://wellplate.streamlit.app")
         s = stripe.checkout.Session.create(
             customer_email=email, payment_method_types=["card"],
-            line_items=[{"price":_secrets.get("STRIPE_PRICE_ID",""),"quantity":1}],
+            line_items=[{"price":_get_secret("STRIPE_PRICE_ID"),"quantity":1}],
             mode="subscription",
             success_url=f"{app_url}?stripe_success=1&session_id={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{app_url}?stripe_cancel=1")
@@ -436,7 +440,7 @@ def create_checkout_url(email):
 def verify_stripe_session(session_id):
     try:
         import stripe
-        stripe.api_key = _secrets.get("STRIPE_SECRET_KEY","")
+        stripe.api_key = _get_secret("STRIPE_SECRET_KEY")
         if not stripe.api_key: return False
         s = stripe.checkout.Session.retrieve(session_id)
         if s.payment_status == "paid":
