@@ -1182,9 +1182,14 @@ elif st.session_state.page == "settings":
             </div>""",unsafe_allow_html=True)
             st.markdown("<br/>",unsafe_allow_html=True)
             if st.button("⭐ Upgrade to Premium",type="primary",use_container_width=True):
-                url=create_checkout_url(st.session_state.get("user_email",""))
-                if url: st.link_button("Complete Payment on Stripe →", url)
-                else: st.info("Add STRIPE_SECRET_KEY and STRIPE_PRICE_ID to secrets to enable payments.")
+                sk = _get_secret("STRIPE_SECRET_KEY")
+                pid = _get_secret("STRIPE_PRICE_ID")
+                if not sk or not pid:
+                    st.error(f"Secrets missing — SK: {'✅' if sk else '❌'} | Price ID: {'✅' if pid else '❌'}")
+                else:
+                    url=create_checkout_url(st.session_state.get("user_email",""))
+                    if url: st.link_button("Complete Payment on Stripe →", url)
+                    else: st.error("Stripe error — check that STRIPE_PRICE_ID is a valid recurring price ID.")
     with tab_data:
         all_meals=get_meals_range(365)
         mode_label = "☁️ Cloud (Supabase)" if USE_SUPABASE else "💻 Local (SQLite)"
