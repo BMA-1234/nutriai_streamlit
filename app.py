@@ -286,6 +286,28 @@ def get_streak() -> int:
             break
     return streak
 
+def get_achievements() -> list:
+    meals = get_meals_range(365)
+    streak = get_streak()
+    water = get_water_today(TODAY)
+    p = get_profile()
+    badges = []
+    if len(meals) >= 1:
+        badges.append({"icon":"🌱","label":"First Meal","color":"#E8F5E9","border":"#A5D6A7"})
+    if len(meals) >= 10:
+        badges.append({"icon":"🍽️","label":"10 Meals","color":"#E3F2FD","border":"#90CAF9"})
+    if len(meals) >= 50:
+        badges.append({"icon":"🏆","label":"50 Meals","color":"#FFF8E1","border":"#FFE082"})
+    if streak >= 3:
+        badges.append({"icon":"🔥","label":f"{streak}-Day Streak","color":"#FFF3E0","border":"#FFCC80"})
+    if streak >= 7:
+        badges.append({"icon":"⚡","label":"Week Warrior","color":"#FFF9C4","border":"#FFF176"})
+    if streak >= 30:
+        badges.append({"icon":"💎","label":"Monthly Master","color":"#F3E5F5","border":"#CE93D8"})
+    if water >= p.get("water_goal_ml", 2500):
+        badges.append({"icon":"💧","label":"Hydrated","color":"#E0F7FA","border":"#80DEEA"})
+    return badges
+
 # ── AI Service ────────────────────────────────────────────────────────────────
 OPENROUTER_URL   = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
@@ -438,12 +460,20 @@ DEFAULTS = {
     "food_results": [],
     "selected_food": None,
     "log_date": TODAY,
+    "onboarded": False,
+    "quick_log_type": None,
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 profile = get_profile()
+
+# Detect first-time user (default name, no meals ever logged)
+if not st.session_state.onboarded:
+    _all = get_meals_range(365)
+    if profile.get("name", "User") == "User" and len(_all) == 0:
+        st.session_state.page = "onboarding"
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -494,7 +524,53 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════════════════════
 # DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════════
-if st.session_state.page == "dashboard":
+# ══════════════════════════════════════════════════════════════════════════════
+# ONBOARDING
+# ══════════════════════════════════════════════════════════════════════════════
+if st.session_state.page == "onboarding":
+    st.markdown("""
+    <div style='text-align:center;padding:30px 0 10px 0'>
+      <div style='font-size:56px'>🥗</div>
+      <div style='font-size:32px;font-weight:800;color:#1B5E20;margin-top:8px'>Welcome to NutriAI</div>
+      <div style='font-size:16px;color:#555;margin-top:6px'>Your personal AI nutrition coach.<br/>Set up your profile in 30 seconds.</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("<br/>", unsafe_allow_html=True)
+    with st.form("onboarding_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            ob_name   = st.text_input("Your name", placeholder="e.g. Alex")
+            ob_height = st.number_input("Height (cm)", value=170, min_value=100, max_value=250)
+            ob_goal   = st.selectbox("Your goal", ["Lose weight","Maintain weight","Gain muscle","Eat healthier"])
+        with col2:
+            ob_age    = st.number_input("Age", value=25, min_value=10, max_value=100)
+            ob_weight = st.number_input("Weight (kg)", value=70.0, min_value=20.0, max_value=300.0, step=0.5)
+            ob_act    = st.selectbox("Activity level", ["sedentary","light","moderate","active","very_active"],
+                index=2, format_func=lambda x: {"sedentary":"🪑 Sedentary","light":"🚶 Light",
+                    "moderate":"🏃 Moderate","active":"💪 Active","very_active":"⚡ Very active"}[x])
+
+        cal_map = {"Lose weight": 1700, "Maintain weight": 2000, "Gain muscle": 2400, "Eat healthier": 2000}
+        pro_map = {"Lose weight": 130, "Maintain weight": 120, "Gain muscle": 160, "Eat healthier": 120}
+
+        submitted = st.form_submit_button("🚀 Get Started", type="primary", use_container_width=True)
+        if submitted:
+            name = ob_name.strip() or "User"
+            cal_g = cal_map[ob_goal]
+            pro_g = pro_map[ob_goal]
+            save_profile({"name": name, "age": ob_age, "height_cm": ob_height,
+                          "weight_kg": ob_weight, "activity_level": ob_act,
+                          "calorie_goal": cal_g, "protein_goal_g": pro_g})
+            st.session_state.onboarded = True
+            st.session_state.page = "dashboard"
+            st.rerun()
+
+    st.markdown("""
+    <div style='text-align:center;margin-top:16px'>
+      <span style='font-size:12px;color:#90A4AE'>You can update all of this later in Profile & Goals</span>
+    </div>""", unsafe_allow_html=True)
+
+elif st.session_state.page == "dashboard":
     today_meals = get_meals(TODAY)
     t = totals(today_meals)
     water = get_water_today(TODAY)
@@ -514,6 +590,32 @@ if st.session_state.page == "dashboard":
       </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # ── Achievement badges ───────────────────────────────────────────────────
+    badges = get_achievements()
+    if badges:
+        badge_html = "".join(
+            f"<span style='display:inline-flex;align-items:center;gap:5px;"
+            f"background:{b['color']};border:1px solid {b['border']};"
+            f"border-radius:20px;padding:5px 14px;font-size:12px;font-weight:700;"
+            f"margin-right:8px;margin-bottom:6px'>{b['icon']} {b['label']}</span>"
+            for b in badges
+        )
+        st.markdown(f"<div style='margin-bottom:12px'>{badge_html}</div>",
+                    unsafe_allow_html=True)
+
+    # ── Quick log shortcuts ──────────────────────────────────────────────────
+    st.markdown('<div class="sec-header">⚡ Quick Log</div>', unsafe_allow_html=True)
+    ql1, ql2, ql3, ql4, ql5 = st.columns(5)
+    ql_btns = [("🌅 Breakfast","breakfast"),("☀️ Lunch","lunch"),
+               ("🌙 Dinner","dinner"),("🍎 Snack","snack"),("🤖 AI Log","ai")]
+    for col, (label, mtype) in zip([ql1,ql2,ql3,ql4,ql5], ql_btns):
+        with col:
+            if st.button(label, use_container_width=True, key=f"ql_{mtype}"):
+                st.session_state.page = "log"
+                st.session_state.quick_log_type = mtype if mtype != "ai" else "ai"
+                st.rerun()
+    st.markdown("<br/>", unsafe_allow_html=True)
 
     # ── Top row: calorie ring + macros ──────────────────────────────────────
     col_ring, col_macros, col_water = st.columns([1.4, 2, 1.4])
@@ -580,10 +682,14 @@ if st.session_state.page == "dashboard":
             st.markdown("""
             <div style='text-align:center;padding:30px 20px;color:#78909C;
                         background:#F7FBF7;border-radius:12px;border:1px dashed #C8E6C9'>
-              <div style='font-size:36px'>🥗</div>
-              <div style='font-weight:600;margin-top:8px'>No meals logged yet</div>
-              <div style='font-size:13px;margin-top:4px'>Head to 🍽️ Log Meal to get started</div>
+              <div style='font-size:40px'>🥗</div>
+              <div style='font-weight:700;font-size:16px;color:#2E7D32;margin-top:10px'>Start tracking your nutrition</div>
+              <div style='font-size:13px;margin-top:5px'>Log your first meal to see your daily breakdown</div>
             </div>""", unsafe_allow_html=True)
+            st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+            if st.button("🍽️ Log My First Meal", type="primary", use_container_width=True):
+                st.session_state.page = "log"
+                st.rerun()
         else:
             for m in today_meals:
                 icon = MEAL_ICONS.get(m["meal_type"], "🍽️")
@@ -638,9 +744,15 @@ elif st.session_state.page == "log":
 
     log_date = st.date_input("Date", value=date.fromisoformat(st.session_state.log_date))
     st.session_state.log_date = log_date.isoformat()
-    meal_type = st.selectbox("Meal type", ["breakfast","lunch","dinner","snack"],
-        format_func=lambda x: f"{MEAL_ICONS[x]} {x.title()}")
 
+    _ql = st.session_state.get("quick_log_type")
+    _meal_types = ["breakfast","lunch","dinner","snack"]
+    _default_idx = _meal_types.index(_ql) if _ql in _meal_types else 0
+    meal_type = st.selectbox("Meal type", _meal_types, index=_default_idx,
+        format_func=lambda x: f"{MEAL_ICONS[x]} {x.title()}")
+    st.session_state.quick_log_type = None  # clear after use
+
+    _default_tab = 1 if _ql == "ai" else 0
     tab_search, tab_ai, tab_manual = st.tabs(["🔍  Search Food", "🤖  AI Analysis", "✏️  Manual Entry"])
 
     def add_meal_form(food_name="", cal=0, pro=0, carb=0, fat=0, fib=0, key_prefix=""):
